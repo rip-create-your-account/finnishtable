@@ -11,8 +11,8 @@ import (
 const bucketSize = 8
 
 type (
-	tophashprobe  uint8
-	triehashprobe uint8
+	tophashprobe  uint64
+	triehashprobe uint64
 )
 
 func makeHashProbes(tophash8 tophash, triehash8 uint8) (tophashprobe, triehashprobe) {
