@@ -48,6 +48,15 @@ backing storage, instead it consists of many (mostly) fixed size small
 allocations. This may have some sort of impact on your
 allocator/GC/whatever_runtime_you_have.
 
+### Size hint / initial capacity
+
+Unlike with the built-in Go map, the initial size hint doesn't end up being
+rounded up to the next power-of-two number. By utilizing the fact that only the
+trie needs to be of a power-of-two size but not the number of buckets per map,
+Finnish table will adjust the number of buckets per map to allocate much more
+precisely the minimal amount of space for the hinted amount of entries. Right
+now you get a load factor of 0.75 after inserting the hinted amount of entries.
+
 ## Sweet little lies
 
 Here Todd Howard sells you the same ~~game~~ data structure for the third time.

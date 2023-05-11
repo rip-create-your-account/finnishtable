@@ -46,11 +46,34 @@ func TestMap(t *testing.T) {
 		1_012_912,
 	}
 
-	for si := range sizes {
-		size := sizes[si]
+	var presizes = [...]int{
+		0,
+		1,
+		15,
+		61,
+		372,
+		21526,
+	}
 
-		t.Run(fmt.Sprintf("size=%v", size), func(t *testing.T) {
-			m := MakeFishTable[int64, int](hasher)
+	type tc struct{ size, presize int }
+	testcases := make([]tc, 0, len(sizes)*len(presizes))
+	for _, size := range sizes {
+		for _, presize := range presizes {
+			testcases = append(testcases, tc{size: size, presize: presize})
+		}
+	}
+
+	for tci := range testcases {
+		size := testcases[tci].size
+		presize := testcases[tci].presize
+
+		t.Run(fmt.Sprintf("size=%v&presize=%v", size, presize), func(t *testing.T) {
+			var m *FishTable[int64, int]
+			if presize == 0 {
+				m = MakeFishTable[int64, int](hasher)
+			} else {
+				m = MakeWithSize[int64, int](presize, hasher)
+			}
 			wantm := make(map[int64]int, size)
 			checkMaps := func() {
 				if m.Len() != len(wantm) {
@@ -160,7 +183,7 @@ var sizes = [...]int{
 	76_124,
 	124_152,
 	9_648_634,
-	// 100 * 1000 * 1000,
+	100 * 1000 * 1000,
 }
 
 // Noinline so that built-in map doesn't get unfair optimizations that impact
@@ -207,6 +230,22 @@ func BenchmarkInserts8B(b *testing.B) {
 					b.Fatal(m.len, size)
 				}
 			}
+			b.StopTimer()
+			b.ReportMetric(m.loadFactor(), "lf/map")
+		})
+		b.Run(fmt.Sprintf("ext=sized&size=%v", size), func(b *testing.B) {
+			var m *FishTable[int64, int64]
+			for j := 0; j < b.N; j++ {
+				m = MakeWithSize[int64, int64](size, hasher)
+				for i := 0; i < size; i++ {
+					m.Put(int64(i), int64(i))
+				}
+				if m.Len() != size {
+					b.Fatal(m.len, size)
+				}
+			}
+			b.StopTimer()
+			b.ReportMetric(m.loadFactor(), "lf/map")
 		})
 	}
 }
@@ -455,6 +494,22 @@ func BenchmarkShortUse(b *testing.B) {
 				}
 			}
 		})
+		b.Run(fmt.Sprintf("ext=sized&size=%v&times=%v", size, times), func(b *testing.B) {
+			for j := 0; j < b.N; j++ {
+				for t := 0; t < times; t++ {
+					m := MakeWithSize[int64, int64](size, hasher)
+					for i := 0; i < size; i++ {
+						m.Put(int64(i), int64(i))
+					}
+					for i := 0; i < size; i++ {
+						v, ok := m.Get(int64(i))
+						if v != int64(i) || !ok {
+							b.Fatal(v, i)
+						}
+					}
+				}
+			}
+		})
 	}
 }
 
@@ -473,6 +528,29 @@ func BenchmarkLoadFactor(b *testing.B) {
 			b.ReportMetric(0, "ns/op") // suppress the metric
 
 			m := makeextmap()
+			for i := 0; i < size; i++ {
+				m.Put(int64(i), int64(i))
+			}
+
+			// simple load factor
+			occupied, totalSlots := m.load()
+			if occupied != uint64(size) {
+				b.Fatalf("got %v want %v", occupied, size)
+			}
+			lf := float64(occupied) / float64(totalSlots)
+			b.ReportMetric(lf, "load-factor")
+
+			// bytes
+			// TODO: Convert slices to unsafe array pointers. So much wasted
+			// bytes in storing the useless "capacity" for the slices
+			stats := mapMemoryStats(m)
+			bf := float64(stats.OccupiedBytes) / float64(stats.TotalSizeInBytes)
+			b.ReportMetric(bf, "xbytes-factor")
+		})
+		b.Run(fmt.Sprintf("ext=sized&size=%v", size), func(b *testing.B) {
+			b.ReportMetric(0, "ns/op") // suppress the metric
+
+			m := MakeWithSize[int64, int64](size, hasher)
 			for i := 0; i < size; i++ {
 				m.Put(int64(i), int64(i))
 			}

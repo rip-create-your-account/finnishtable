@@ -56,7 +56,17 @@ type bucket[K comparable, V any] struct {
 }
 
 func indexIntoBuckets(hash tophash, numBuckets int) uint8 {
-	return hash & uint8(numBuckets-1)
+	// https://lemire.me/blog/2016/06/27/a-fast-alternative-to-the-modulo-reduction/
+	return uint8((uint16(hash) * uint16(numBuckets)) >> 8)
+}
+
+func nextIndexIntoBuckets(idx uint8, numBuckets int) uint8 {
+	res := idx + 1
+	m := uint8(1)
+	if res >= uint8(numBuckets) {
+		m = 0
+	}
+	return res * m
 }
 
 // A Finnish hash table, or fish for short. Stores key-value pairs.
@@ -93,25 +103,64 @@ func MakeFishTable[K comparable, V any](hasher func(key K, seed uint64) uint64) 
 	// m.Iterate() slower by a good amount
 	m.seed = runtime_fastrand64()
 
-	// TODO: sizehint to pre-allocate the trie to a size where we will not need
-	// to rehash shit too much. The actual maps could be allocated just-in-time
-	// when inserting.
+	return m
+}
+
+func MakeWithSize[K comparable, V any](size int, hasher func(key K, seed uint64) uint64) *FishTable[K, V] {
+	m := new(FishTable[K, V])
+	m.hasher = hasher
+
+	// The funny thing with random seed is that it makes cloning via
+	// m.Iterate() slower by a good amount
+	m.seed = runtime_fastrand64()
+
+	if size <= 0 {
+		return m
+	}
+
+	// Adjust size hint to accommodate for our max load factor.
+	sizeAdjusted := size * 4 / 3
+	if sizeAdjusted < size {
+		sizeAdjusted = size
+	}
+
+	// Calculate how many maps and buckets per map we need.
 	//
-	// numMapsPerSizeHint := 1 << bits.Len(sizehint/256 ???)
-	// m.trie = make([]*smolMap2[K, V], numMapsPerSizeHint)
+	// Here we prefer creating the least amount of maps necessary, creating as
+	// big maps as possible.
+	//
+	// NOTE: The trie size MUST be a power of two but the number of buckets per
+	// map doesn't need to be so.
+	//
+	// TODO: Try sizing so that we end up with plenty of triehash bits that are
+	// useful while probing.
+	numMaps := sizeAdjusted / maxEntriesPerMap
+	numMaps = 1 << bits.Len(uint(numMaps))
+	numBuckets := sizeAdjusted / numMaps / bucketSize
+	if numBuckets <= 0 {
+		numBuckets = 1
+	}
+	if numBuckets > maxBuckets {
+		panic("oops")
+	}
+
+	initialDepth := uint8(bits.TrailingZeros(uint(numMaps)))
+
+	// TODO: WHERE'S MY BULK ALLOCATION?
+	m.trie = make([]*smolMap2[K, V], numMaps)
+	for i := range m.trie {
+		m.trie[i] = makeSmolMap2[K, V](numBuckets)
+		m.trie[i].depth = initialDepth
+	}
 
 	return m
 }
 
 type smolMap2[K comparable, V any] struct {
-	// TODO: Make it so that the number of buckets in a map doesn't need to be
-	// a power of two. I suppose the max number of buckets needs to stay as
-	// 256. The purpose would be to allow allocating such a count of buckets
-	// that the space required is a "neat" number no matter the K and V types.
-	// Such that one could try to match the system page size or some other
-	// target.
+	// NOTE: len(bucketmetas) is not always a power-of-two
 	bucketmetas []bucketmeta
-	buckets     []bucket[K, V]
+	// NOTE: len(buckets) is not always a power-of-two
+	buckets []bucket[K, V]
 
 	depth      uint8 // <= 64
 	preferGrow bool
@@ -178,7 +227,7 @@ func (m *FishTable[K, V]) Get(k K) (V, bool) {
 				goto miss
 			}
 
-			bucketIndex = (bucketIndex + 1) & uint8(len(mapmetas)-1)
+			bucketIndex = nextIndexIntoBuckets(bucketIndex, len(mapmetas))
 			if bucketIndex == max {
 				goto miss
 			}
@@ -212,8 +261,8 @@ func (m *FishTable[K, V]) Delete(k K) {
 	}
 
 	tophashProbe, triehashProbe := makeHashProbes(tophash8, triehash8)
-	bucketIndex := uint(indexIntoBuckets(tophash8, len(mapmetas))) // start looking from tophash8 location
-	max := bucketIndex                                             // loop around once
+	bucketIndex := indexIntoBuckets(tophash8, len(mapmetas)) // start looking from tophash8 location
+	max := bucketIndex                                       // loop around once
 
 	for {
 		bucketmetas := &mapmetas[bucketIndex]
@@ -253,7 +302,7 @@ func (m *FishTable[K, V]) Delete(k K) {
 				// TODO: More thoughtful shrinking. As a starting point we at
 				// least reduce the number of buckets to match the number of
 				// entries that remain in the map.
-				if sm.pop <= uint16(len(sm.bucketmetas)*(bucketSize/4)) {
+				if sm.pop <= uint16(len(mapmetas)*(bucketSize/4)) {
 					// When empty, release the buckets
 					// TODO: Shrink the trie? Some other shrinking strategy?
 					if sm.pop == 0 {
@@ -272,11 +321,11 @@ func (m *FishTable[K, V]) Delete(k K) {
 		empties := finder.EmptySlots()
 		if empties.HasCurrent() {
 			// No need to look further - the probing during inserting would
-			// have placed the key into this slot.
+			// have placed the key into one of these empty slots.
 			return
 		}
 
-		bucketIndex = (bucketIndex + 1) & uint(len(mapmetas)-1)
+		bucketIndex = nextIndexIntoBuckets(bucketIndex, len(mapmetas))
 		if bucketIndex == max {
 			return
 		}
@@ -332,19 +381,18 @@ top:
 	}
 
 	tophashProbe, triehashProbe := makeHashProbes(tophash8, triehash8)
-	bucketIndex := uint(indexIntoBuckets(tophash8, len(mapmetas))) // start looking from tophash8 location
-	max := bucketIndex + uint(len(mapmetas))                       // loop around once
-	bucketMask := uint(len(mapmetas) - 1)
+	bucketIndex := indexIntoBuckets(tophash8, len(mapmetas)) // start looking from tophash8 location
+	max := bucketIndex                                       // loop around once
 
 	for {
-		bucketmetas := &mapmetas[bucketIndex&bucketMask]
+		bucketmetas := &mapmetas[bucketIndex]
 		finder := bucketmetas.Finder()
 
 		hashMatches := finder.ProbeHashMatches(tophashProbe, triehashProbe)
 		for ; hashMatches.HasCurrent(); hashMatches.Advance() {
 			idx := hashMatches.Current()
 
-			bucket := &sm.buckets[bucketIndex&bucketMask]
+			bucket := &sm.buckets[bucketIndex]
 			if bucket.keys[idx] == k {
 				bucket.values[idx] = v
 				return
@@ -368,7 +416,7 @@ top:
 			// TODO: If we saw a tombstone along the way then we could also
 			// take that spot. But do I care to? NO!
 
-			bucket := &sm.buckets[bucketIndex&bucketMask]
+			bucket := &sm.buckets[bucketIndex]
 			bucket.keys[idx] = k
 			bucket.values[idx] = v
 			bucketmetas.tophash8[idx] = tophash8
@@ -403,7 +451,7 @@ top:
 			return
 		}
 
-		bucketIndex++
+		bucketIndex = nextIndexIntoBuckets(bucketIndex, len(mapmetas))
 		if bucketIndex == max {
 			// THIS IS WHERE WE GROW THEM!
 			m.makeSpaceForMap(sm, hash)
@@ -465,13 +513,12 @@ func (m *FishTable[K, V]) makeSpaceForMap(sm *smolMap2[K, V], hash uint64) {
 type bucketInserter [maxBuckets]uint8
 
 func (freeSlots *bucketInserter) findSlot(preferredBucketIdx uint8, numBuckets int) (uint8, uint8) {
-	idxMask := uint8(numBuckets - 1)
 	bucketIdx := preferredBucketIdx
-	max := (bucketIdx + uint8(numBuckets)) & idxMask
+	max := bucketIdx // loop around once
 	for {
 		nextFreeInBucket := freeSlots[bucketIdx]
 		if nextFreeInBucket >= bucketSize {
-			bucketIdx = (bucketIdx + 1) & idxMask
+			bucketIdx = nextIndexIntoBuckets(bucketIdx, numBuckets)
 			if bucketIdx == max {
 				panic("how?")
 			}
@@ -485,13 +532,12 @@ func (freeSlots *bucketInserter) findSlot(preferredBucketIdx uint8, numBuckets i
 type bucketTracker [maxBuckets][bucketSize]uint8
 
 func (tracker *bucketTracker) findSlot(preferredBucketIdx uint8, numBuckets int, unfortunateBucket, unfortunateSlot uint8) (uint8, uint8) {
-	idxMask := uint8(numBuckets - 1)
 	bucketIdx := preferredBucketIdx
-	max := (bucketIdx + uint8(numBuckets)) & idxMask
+	max := bucketIdx // loop around once
 	for {
 		takeable := findZeros(&tracker[bucketIdx])
 		if !takeable.HasCurrent() {
-			bucketIdx = (bucketIdx + 1) & idxMask
+			bucketIdx = nextIndexIntoBuckets(bucketIdx, numBuckets)
 			if bucketIdx == max {
 				panic("how?")
 			}
@@ -679,6 +725,9 @@ func (h *FishTable[K, V]) split(m *smolMap2[K, V]) (*smolMap2[K, V], *smolMap2[K
 
 func (h *FishTable[K, V]) inplaceGrowSmol(m *smolMap2[K, V]) {
 	newSize := len(m.bucketmetas) * 2
+	if newSize > maxBuckets {
+		newSize = maxBuckets
+	}
 
 	left := makeSmolMap2[K, V](newSize)
 	left.depth = m.depth
@@ -829,7 +878,7 @@ func makeSmolMap2[K comparable, V any](buckets int) *smolMap2[K, V] {
 	// allocation size-class. Or maybe limit the allocation to the page size.
 	// What happens when all of the hashmaps in the software do allocations of
 	// the same size, no matter what the K and V types are for those maps?
-	if buckets > maxBuckets || bits.OnesCount(uint(buckets)) != 1 {
+	if buckets > maxBuckets {
 		println(buckets)
 		panic("bad size")
 	}
@@ -858,4 +907,9 @@ func (m *FishTable[K, V]) load() (occupied, totalSlots uint64) {
 		}
 	}
 	return occupied, totalSlots
+}
+
+func (m *FishTable[K, V]) loadFactor() float64 {
+	occupied, totalSlots := m.load()
+	return float64(occupied) / float64(totalSlots)
 }
