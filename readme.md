@@ -133,8 +133,6 @@ Compiling with "--tags nosimd" is usually faster as it just does SWAR written
 in Go. For any curious reader, the above benchmarks are all calling into the
 asm.
 
-# Sources
-
 [^1]: This was revealed to me in a dream. Beyond my cryptic dreams I'm pretty
   sure that there's a paper out there that repeats this message. One of course
   could just look at the allocator/GC code and think for oneself from that.
