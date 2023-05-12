@@ -24,7 +24,7 @@ TEXT ·FindHashes(SB), NOSPLIT, $0-26
 	PMOVMSKB X0, AX
 	MOVW     AX, ret+24(FP)
 	RET
-	
+
 // func FindEmpty(tophashes *[16]uint8) uint16
 // Requires: SSE2
 TEXT ·FindEmpty(SB), NOSPLIT, $0-10

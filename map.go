@@ -1,7 +1,6 @@
 package finnishtable
 
 import (
-	"math"
 	"math/bits"
 	_ "unsafe"
 )
@@ -16,6 +15,21 @@ const (
 	maxBuckets = 32
 
 	maxEntriesPerMap = maxBuckets * bucketSize
+
+	// How many splits to do before recalculating the hash for the keys? This
+	// ensures that at least 8-(triehashBoundary) bits are always usable when
+	// matching hashes.
+	//
+	// When the small hash table has 32 buckets, it means that the most
+	// significant 5 bits of the tophash are all same between the entries
+	// inside one bucket. This leaves 3 bits of entropy, or 8 different
+	// possible values. Original plan was to use SIMD based key equality check
+	// as well but that will surely have to wait. So to avoid unbearably large
+	// amount of false positive hash equalities we ensure that the triehash
+	// always give at least 4 bits of entropy. In the best case it gives 8
+	// which is nice and to sum it up: in total we have for the worst case 7
+	// bits, best case 11 bits. Swiss table always has 7 bits.
+	triehashBoundary = 4
 )
 
 type tophash = uint8
@@ -186,8 +200,8 @@ func (m *FishTable[K, V]) Get(k K) (V, bool) {
 			goto miss
 		}
 
-		if len(m.trie) > 128 {
-			triehash8 = uint8(hash >> (sm.depth / 8 * 8)) // NOTE: Humbug! For large tries this is always a cache-miss
+		if len(m.trie) >= (1 << triehashBoundary) {
+			triehash8 = uint8(hash >> (sm.depth / triehashBoundary * triehashBoundary)) // NOTE: Humbug! For large tries this is always a cache-miss
 		}
 
 		tophashProbe, triehashProbe := makeHashProbes(tophash8, triehash8)
@@ -256,8 +270,8 @@ func (m *FishTable[K, V]) Delete(k K) {
 		return
 	}
 
-	if len(m.trie) > 128 {
-		triehash8 = uint8(hash >> (sm.depth / 8 * 8)) // NOTE: Humbug! For large tries this is always a cache-miss
+	if len(m.trie) >= (1 << triehashBoundary) {
+		triehash8 = uint8(hash >> (sm.depth / triehashBoundary * triehashBoundary)) // NOTE: Humbug! For large tries this is always a cache-miss
 	}
 
 	tophashProbe, triehashProbe := makeHashProbes(tophash8, triehash8)
@@ -376,8 +390,8 @@ top:
 		mapmetas = sm.bucketmetas
 	}
 
-	if len(m.trie) > 128 {
-		triehash8 = uint8(hash >> (sm.depth / 8 * 8)) // NOTE: Humbug! For large tries this is always a cache-miss
+	if len(m.trie) >= (1 << triehashBoundary) {
+		triehash8 = uint8(hash >> (sm.depth / triehashBoundary * triehashBoundary)) // NOTE: Humbug! For large tries this is always a cache-miss
 	}
 
 	tophashProbe, triehashProbe := makeHashProbes(tophash8, triehash8)
@@ -438,8 +452,9 @@ top:
 				// through the whole shit. We get to defer the allocation and
 				// life is kinda good.
 				// TODO: Remove?
-				maxLoad = math.MaxUint16
-			} else if len(mapmetas) > 4 {
+				return
+			}
+			if len(mapmetas) > 4 {
 				// Chosen load factor limit is RNG generated.
 				maxLoad = uint16(len(mapmetas) * (bucketSize * 9 / 10))
 			}
@@ -471,7 +486,7 @@ func (m *FishTable[K, V]) makeSpaceForMap(sm *smolMap2[K, V], hash uint64) {
 	// Also, if map has shrunk a lot after Delete()s we want to grow instead of
 	// splitting. Also it's nice to try to milk as much as possible out of the
 	// initial triehash8.
-	reallyShouldPreferGrow := sm.depth >= 7
+	reallyShouldPreferGrow := sm.depth >= (triehashBoundary - 1)
 	if (reallyShouldPreferGrow || sm.preferGrow) && len(sm.bucketmetas) < maxBuckets {
 		m.inplaceGrowSmol(sm)
 		sm.preferGrow = false // split next time
@@ -627,8 +642,26 @@ func (h *FishTable[K, V]) split(m *smolMap2[K, V]) (*smolMap2[K, V], *smolMap2[K
 	right := makeSmolMap2[K, V](len(m.bucketmetas))
 	right.depth = m.depth
 
-	oldDepthBit := uint8(1 << ((right.depth - 1) % 8))
-	isAt8Boundary := m.depth&(8-1) == 0
+	oldDepthBit := uint8(1 << ((right.depth - 1) % triehashBoundary))
+	isAtTriehashBoundary := (m.depth % triehashBoundary) == 0
+
+	// Prove some stuff to the compiler so that the loops don't generate so
+	// many bounds checks.
+	if len(m.bucketmetas) != len(right.bucketmetas) {
+		panic("oops")
+	}
+	if len(m.buckets) != len(right.buckets) {
+		panic("oops")
+	}
+	if len(m.bucketmetas) != len(m.buckets) {
+		panic("oops")
+	}
+	if len(right.bucketmetas) != len(right.buckets) {
+		panic("oops")
+	}
+	if len(m.bucketmetas) > maxBuckets {
+		panic("oops")
+	}
 
 	{
 		// Move all applicable entries to the "right" map and clear tombstones
@@ -652,9 +685,9 @@ func (h *FishTable[K, V]) split(m *smolMap2[K, V]) (*smolMap2[K, V], *smolMap2[K
 
 				goesRight := bucketmetas.triehash8[slotInBucket]&oldDepthBit > 0
 
-				if isAt8Boundary {
+				if isAtTriehashBoundary {
 					hash := h.hasher(bucket.keys[slotInBucket], h.seed)
-					triehash8 := uint8(hash >> (m.depth / 8 * 8))
+					triehash8 := uint8(hash >> (m.depth / triehashBoundary * triehashBoundary))
 					bucketmetas.triehash8[slotInBucket] = triehash8
 				}
 
@@ -665,10 +698,12 @@ func (h *FishTable[K, V]) split(m *smolMap2[K, V]) (*smolMap2[K, V], *smolMap2[K
 				preferredBucketIdx := indexIntoBuckets(bucketmetas.tophash8[slotInBucket], len(right.bucketmetas))
 				bucketIdx, nextFreeInBucket := rightInserter.findSlot(preferredBucketIdx, len(right.bucketmetas))
 
-				right.bucketmetas[bucketIdx].tophash8[nextFreeInBucket] = bucketmetas.tophash8[slotInBucket]
-				right.bucketmetas[bucketIdx].triehash8[nextFreeInBucket] = bucketmetas.triehash8[slotInBucket]
-				right.buckets[bucketIdx].keys[nextFreeInBucket] = bucket.keys[slotInBucket]
-				right.buckets[bucketIdx].values[nextFreeInBucket] = bucket.values[slotInBucket]
+				dstmetas := &right.bucketmetas[bucketIdx]
+				dstbuckets := &right.buckets[bucketIdx]
+				dstmetas.tophash8[nextFreeInBucket] = bucketmetas.tophash8[slotInBucket]
+				dstmetas.triehash8[nextFreeInBucket] = bucketmetas.triehash8[slotInBucket]
+				dstbuckets.keys[nextFreeInBucket] = bucket.keys[slotInBucket]
+				dstbuckets.values[nextFreeInBucket] = bucket.values[slotInBucket]
 				right.pop++
 
 				// Zero the slot left behind. Only setting the tophash8 to
@@ -693,32 +728,7 @@ func (h *FishTable[K, V]) split(m *smolMap2[K, V]) (*smolMap2[K, V], *smolMap2[K
 
 	// For the remaining entries in 'left' we need to pack them tightly, each
 	// entry as close as possible to it's optimal bucket
-
-	var leftTracker bucketTracker
-	for bucketIndex := 0; bucketIndex < len(m.bucketmetas); bucketIndex++ {
-		bucketmetas := &m.bucketmetas[bucketIndex]
-		bucket := &m.buckets[bucketIndex]
-
-		finder := bucketmetas.Finder()
-		matches := finder.PresentSlots()
-		for ; matches.HasCurrent(); matches.Advance() {
-			slotInBucket := matches.Current()
-
-			// Was this key already looked for? If the slot is no longer free
-			// then we know that earlier we were placed it here into this
-			// current slot.
-			if leftTracker[bucketIndex][slotInBucket] != 0 {
-				continue
-			}
-
-			for {
-				swapped := placeTightly(m, bucketmetas, bucket, uint8(slotInBucket), uint8(bucketIndex), &leftTracker)
-				if !swapped {
-					break
-				}
-			}
-		}
-	}
+	rehashInplace(h, left)
 
 	return left, right
 }
@@ -764,10 +774,12 @@ func (h *FishTable[K, V]) moveSmol(dst, src *smolMap2[K, V]) {
 			preferredBucketIdx := indexIntoBuckets(bucketmetas.tophash8[slotInBucket], len(dst.bucketmetas))
 			bucketIdx, nextFreeInBucket := leftInserter.findSlot(preferredBucketIdx, len(dst.bucketmetas))
 
-			dst.bucketmetas[bucketIdx].tophash8[nextFreeInBucket] = bucketmetas.tophash8[slotInBucket]
-			dst.bucketmetas[bucketIdx].triehash8[nextFreeInBucket] = bucketmetas.triehash8[slotInBucket]
-			dst.buckets[bucketIdx].keys[nextFreeInBucket] = bucket.keys[slotInBucket]
-			dst.buckets[bucketIdx].values[nextFreeInBucket] = bucket.values[slotInBucket]
+			dstmetas := &dst.bucketmetas[bucketIdx]
+			dstbuckets := &dst.buckets[bucketIdx]
+			dstmetas.tophash8[nextFreeInBucket] = bucketmetas.tophash8[slotInBucket]
+			dstmetas.triehash8[nextFreeInBucket] = bucketmetas.triehash8[slotInBucket]
+			dstbuckets.keys[nextFreeInBucket] = bucket.keys[slotInBucket]
+			dstbuckets.values[nextFreeInBucket] = bucket.values[slotInBucket]
 			dst.pop++
 
 			// NOTE: No need to clear the old slot, we do it after the loop
@@ -785,9 +797,10 @@ func rehashInplace[K comparable, V any](h *FishTable[K, V], m *smolMap2[K, V]) {
 	m.pop = 0 // placeTightly increments pop for every entry
 
 	var tracker bucketTracker
-	for bucketIndex := 0; bucketIndex < len(m.buckets); bucketIndex++ {
+	for bucketIndex := 0; bucketIndex < len(m.bucketmetas); bucketIndex++ {
 		bucketmetas := &m.bucketmetas[bucketIndex]
 		bucket := &m.buckets[bucketIndex]
+		trackingBucket := &tracker[bucketIndex]
 
 		finder := bucketmetas.Finder()
 
@@ -803,7 +816,7 @@ func rehashInplace[K comparable, V any](h *FishTable[K, V], m *smolMap2[K, V]) {
 			// Was this key already looked for? If the slot is no longer free
 			// then we know that earlier we were placed it here into this
 			// current slot.
-			if tracker[bucketIndex][slotInBucket] != 0 {
+			if trackingBucket[slotInBucket] != 0 {
 				continue
 			}
 

@@ -3,8 +3,10 @@ package finnishtable
 import (
 	"fmt"
 	"math"
+	"runtime"
 	"strconv"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -47,12 +49,13 @@ func TestMap(t *testing.T) {
 	}
 
 	var presizes = [...]int{
-		0,
+		0, // no presizing
 		1,
 		15,
 		61,
 		372,
 		21526,
+		10 * 1_012_912,
 	}
 
 	type tc struct{ size, presize int }
@@ -182,8 +185,9 @@ var sizes = [...]int{
 	39_127,
 	76_124,
 	124_152,
+	2_500_000,
 	9_648_634,
-	100 * 1000 * 1000,
+	// 100 * 1000 * 1000, // Mayor of the Cache-miss town
 }
 
 // Noinline so that built-in map doesn't get unfair optimizations that impact
@@ -209,6 +213,9 @@ func BenchmarkInserts8B(b *testing.B) {
 		size := sizes[si]
 
 		b.Run(fmt.Sprintf("ext=false&size=%v", size), func(b *testing.B) {
+			var memstats1 runtime.MemStats
+			runtime.ReadMemStats(&memstats1)
+
 			for j := 0; j < b.N; j++ {
 				m := makemap()
 				for i := 0; i < size; i++ {
@@ -218,8 +225,18 @@ func BenchmarkInserts8B(b *testing.B) {
 					b.Fatal(len(m), size)
 				}
 			}
+			b.StopTimer()
+			b.ReportMetric((float64(b.Elapsed()))/float64(b.N*size), "ns/insert")
+
+			var memstats2 runtime.MemStats
+			runtime.ReadMemStats(&memstats2)
+			b.ReportMetric(float64(memstats2.NumGC-memstats1.NumGC)/float64(b.N), "gc/op")
+			b.ReportMetric(float64(memstats2.PauseTotalNs-memstats1.PauseTotalNs)/float64(b.N), "gc-stw-ns/op")
 		})
 		b.Run(fmt.Sprintf("ext=true&size=%v", size), func(b *testing.B) {
+			var memstats1 runtime.MemStats
+			runtime.ReadMemStats(&memstats1)
+
 			var m *FishTable[int64, int64]
 			for j := 0; j < b.N; j++ {
 				m = makeextmap()
@@ -231,9 +248,18 @@ func BenchmarkInserts8B(b *testing.B) {
 				}
 			}
 			b.StopTimer()
+			b.ReportMetric((float64(b.Elapsed()))/float64(b.N*size), "ns/insert")
 			b.ReportMetric(m.loadFactor(), "lf/map")
+
+			var memstats2 runtime.MemStats
+			runtime.ReadMemStats(&memstats2)
+			b.ReportMetric(float64(memstats2.NumGC-memstats1.NumGC)/float64(b.N), "gc/op")
+			b.ReportMetric(float64(memstats2.PauseTotalNs-memstats1.PauseTotalNs)/float64(b.N), "gc-stw-ns/op")
 		})
 		b.Run(fmt.Sprintf("ext=sized&size=%v", size), func(b *testing.B) {
+			var memstats1 runtime.MemStats
+			runtime.ReadMemStats(&memstats1)
+
 			var m *FishTable[int64, int64]
 			for j := 0; j < b.N; j++ {
 				m = MakeWithSize[int64, int64](size, hasher)
@@ -245,7 +271,13 @@ func BenchmarkInserts8B(b *testing.B) {
 				}
 			}
 			b.StopTimer()
+			b.ReportMetric((float64(b.Elapsed()))/float64(b.N*size), "ns/insert")
 			b.ReportMetric(m.loadFactor(), "lf/map")
+
+			var memstats2 runtime.MemStats
+			runtime.ReadMemStats(&memstats2)
+			b.ReportMetric(float64(memstats2.NumGC-memstats1.NumGC)/float64(b.N), "gc/op")
+			b.ReportMetric(float64(memstats2.PauseTotalNs-memstats1.PauseTotalNs)/float64(b.N), "gc-stw-ns/op")
 		})
 	}
 }
@@ -463,6 +495,8 @@ func BenchmarkShortUse(b *testing.B) {
 		times := times[si]
 
 		b.Run(fmt.Sprintf("ext=false&size=%v&times=%v", size, times), func(b *testing.B) {
+			var memstats1 runtime.MemStats
+			runtime.ReadMemStats(&memstats1)
 			for j := 0; j < b.N; j++ {
 				for k := 0; k < times; k++ {
 					m := makemap()
@@ -477,8 +511,14 @@ func BenchmarkShortUse(b *testing.B) {
 					}
 				}
 			}
+			var memstats2 runtime.MemStats
+			runtime.ReadMemStats(&memstats2)
+			b.ReportMetric(float64(memstats2.NumGC-memstats1.NumGC)/float64(b.N), "gc/op")
+			b.ReportMetric(float64(memstats2.PauseTotalNs-memstats1.PauseTotalNs)/float64(b.N), "gc-stw-ns/op")
 		})
 		b.Run(fmt.Sprintf("ext=true&size=%v&times=%v", size, times), func(b *testing.B) {
+			var memstats1 runtime.MemStats
+			runtime.ReadMemStats(&memstats1)
 			for j := 0; j < b.N; j++ {
 				for t := 0; t < times; t++ {
 					m := makeextmap()
@@ -493,8 +533,14 @@ func BenchmarkShortUse(b *testing.B) {
 					}
 				}
 			}
+			var memstats2 runtime.MemStats
+			runtime.ReadMemStats(&memstats2)
+			b.ReportMetric(float64(memstats2.NumGC-memstats1.NumGC)/float64(b.N), "gc/op")
+			b.ReportMetric(float64(memstats2.PauseTotalNs-memstats1.PauseTotalNs)/float64(b.N), "gc-stw-ns/op")
 		})
 		b.Run(fmt.Sprintf("ext=sized&size=%v&times=%v", size, times), func(b *testing.B) {
+			var memstats1 runtime.MemStats
+			runtime.ReadMemStats(&memstats1)
 			for j := 0; j < b.N; j++ {
 				for t := 0; t < times; t++ {
 					m := MakeWithSize[int64, int64](size, hasher)
@@ -509,6 +555,10 @@ func BenchmarkShortUse(b *testing.B) {
 					}
 				}
 			}
+			var memstats2 runtime.MemStats
+			runtime.ReadMemStats(&memstats2)
+			b.ReportMetric(float64(memstats2.NumGC-memstats1.NumGC)/float64(b.N), "gc/op")
+			b.ReportMetric(float64(memstats2.PauseTotalNs-memstats1.PauseTotalNs)/float64(b.N), "gc-stw-ns/op")
 		})
 	}
 }
@@ -528,9 +578,12 @@ func BenchmarkLoadFactor(b *testing.B) {
 			b.ReportMetric(0, "ns/op") // suppress the metric
 
 			m := makeextmap()
+			start := time.Now()
 			for i := 0; i < size; i++ {
 				m.Put(int64(i), int64(i))
 			}
+			duration := time.Since(start)
+			b.ReportMetric(float64(duration)/float64(size), "ns/insert")
 
 			// simple load factor
 			occupied, totalSlots := m.load()
@@ -551,9 +604,12 @@ func BenchmarkLoadFactor(b *testing.B) {
 			b.ReportMetric(0, "ns/op") // suppress the metric
 
 			m := MakeWithSize[int64, int64](size, hasher)
+			start := time.Now()
 			for i := 0; i < size; i++ {
 				m.Put(int64(i), int64(i))
 			}
+			duration := time.Since(start)
+			b.ReportMetric(float64(duration)/float64(size), "ns/insert")
 
 			// simple load factor
 			occupied, totalSlots := m.load()

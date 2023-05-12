@@ -54,7 +54,8 @@ func (m *matchiter) HasCurrent() bool {
 }
 
 func (m *matchiter) Current() uint8 {
-	return uint8(bits.TrailingZeros16(m.hashMatches))
+	// TODO: Remove masking when the compiler is smarter
+	return uint8(bits.TrailingZeros16(m.hashMatches)) & (16 - 1)
 }
 
 func (m *matchiter) Advance() {
