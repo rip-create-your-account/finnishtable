@@ -124,8 +124,6 @@ type FishTable[K comparable, V any] struct {
 // finding that keys that are close to each other ended up into the same
 // hashmap. For your access pattern this may mean much more effective use of
 // your CPU caches.
-//
-// WARNING: panics if bucketSize (8 or 16) keys have the exact same hash value.
 func MakeFishTable[K comparable, V any](hasher func(key K, seed uint64) uint64) *FishTable[K, V] {
 	m := new(FishTable[K, V])
 	m.hasher = func(key unsafe.Pointer, seed uintptr) uintptr {

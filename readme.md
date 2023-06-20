@@ -69,21 +69,21 @@ that _times_ times and there you have one "op." Key and value are both 64-bits.
     fish=false&size=7&times=10000        2199945 ns/op      1920000 B/op    20000 allocs/op
     fish=true&size=7&times=10000         3544430 ns/op      4000000 B/op    20000 allocs/op
     fish=false&size=33&times=1000        2846731 ns/op      2422751 B/op     9047 allocs/op
-    fish=true&size=33&times=1000         2042681 ns/op      1344000 B/op     8000 allocs/op
+    fish=true&size=33&times=1000         1922391 ns/op      1922391 B/op     8747 allocs/op
     fish=false&size=121&times=1000      11314968 ns/op     11016912 B/op    20937 allocs/op
-    fish=true&size=121&times=1000        7859773 ns/op      4676730 B/op    19508 allocs/op
+    fish=true&size=121&times=1000        7089865 ns/op      7922416 B/op    15904 allocs/op
     fish=false&size=795&times=1000      59302975 ns/op     45040234 B/op    56524 allocs/op
-    fish=true&size=795&times=1000       50992625 ns/op     32820657 B/op    56517 allocs/op
+    fish=true&size=795&times=1000       39831838 ns/op     32084966 B/op    23752 allocs/op
     fish=false&size=1092&times=1000     90666254 ns/op     86812278 B/op    66993 allocs/op
-    fish=true&size=1092&times=1000      77558622 ns/op     50044333 B/op    78711 allocs/op
+    fish=true&size=1092&times=1000      58372264 ns/op     49989331 B/op    29632 allocs/op
     fish=false&size=1976&times=200      34487428 ns/op     34691945 B/op    20330 allocs/op
-    fish=true&size=1976&times=200       27289408 ns/op     22544446 B/op    21221 allocs/op
+    fish=true&size=1976&times=200       21424161 ns/op     17471373 B/op     8592 allocs/op
     fish=false&size=2359&times=200      37926931 ns/op     34755320 B/op    20636 allocs/op
-    fish=true&size=2359&times=200       30594804 ns/op     24784963 B/op    22193 allocs/op
+    fish=true&size=2359&times=200       23959959 ns/op     17494322 B/op    8613 allocs/op
     fish=false&size=6215&times=200      92299503 ns/op     71584121 B/op    43602 allocs/op
-    fish=true&size=6215&times=200       77128146 ns/op     40706742 B/op    32196 allocs/op
+    fish=true&size=6215&times=200       64014923 ns/op     32748146 B/op    14135 allocs/op
     fish=false&size=500000&times=5     432175780 ns/op    218992418 B/op    96058 allocs/op
-    fish=true&size=500000&times=5      353778978 ns/op     94694666 B/op    30912 allocs/op
+    fish=true&size=500000&times=5      304238243 ns/op     95116124 B/op    33081 allocs/op
 
 fish=false is built-in map, fish=true is Finnish table. Please do note that my
 preferred cpu is Intel/Haswell.
