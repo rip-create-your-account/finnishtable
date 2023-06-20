@@ -5,10 +5,10 @@
 package asm
 
 //go:noescape
-func FindHashes(tophashes *[16]uint8, triehashes *[16]uint8, tophash8 uint8, triehash8 uint8) uint16
+func FindHashesAndEmpties(tophashes *[16]uint8, triehashes *[16]uint8, tophash8 uint8, triehash8 uint8) (hashes uint16, empties uint16)
 
 //go:noescape
 func FindEmpty(tophashes *[16]uint8) uint16
 
 //go:noescape
-func FindPresent(tophashes *[16]uint8) uint16
+func FindBytesWhereBitsRemainSetAfterApplyingThisMask(hashes *[16]uint8, mask uint8) uint16

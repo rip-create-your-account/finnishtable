@@ -2,10 +2,11 @@
 
 ## Features
 
- - fast insert
- - grows very fast
- - slower lookup
- - slower remove
+ - malleable insert
+ - grows
+ - shrinks
+ - lookup
+ - remove
  - meaningless name
  - bugs that will not be fixed. This is just an attempt to bully other people
    to do extendible hashing but better than I did. (Please don't just copy and
@@ -40,7 +41,7 @@ loaded in the preceding linear probing, and there's only very little of it
 growth-causing Put can do is pretty much limited to 2x the size of the small
 hash table that became full.
 
-Shrinks by halving the number of buckets in the small hash tables.
+Shrinks when big. Doesn't allocate or hash keys when shrinking.
 
 ## Size hint / initial capacity
 
@@ -132,6 +133,24 @@ Plenty of cycles are being wasted in calling the functions written in asm.
 Compiling with "--tags nosimd" is usually faster as it just does SWAR written
 in Go. For any curious reader, the above benchmarks are all calling into the
 asm.
+
+# Silly stuff
+
+Extendible hashing gives us a shitty opportunity to do locality-sensitive
+hashing so that keys that are "near" each other also end up close to each other
+in memory. When doing inserts/lookups/whatever in order then your CPU caches
+remain useful. It just about works when inserting 64-bit integers from 0 to 100
+million:
+
+    insert8ByteKey8ByteValue/ext=true&size=100000000&lsh=false   13793889356 ns/op   137.9 ns/insert
+    insert8ByteKey8ByteValue/ext=true&size=100000000&lsh=true     6970518291 ns/op    69.7 ns/insert
+    
+and then for lookups:
+
+    lookup8ByteKey8ByteValue/ext=true&size=100000000&lsh=false   16412172661 ns/op
+    lookup8ByteKey8ByteValue/ext=true&size=100000000&lsh=true     9062749180 ns/op    
+
+# Sources
 
 [^1]: This was revealed to me in a dream. Beyond my cryptic dreams I'm pretty
   sure that there's a paper out there that repeats this message. One of course

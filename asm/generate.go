@@ -14,34 +14,40 @@ func main() {
 	ConstraintExpr("amd64")
 
 	{
-		TEXT("FindHashes", NOSPLIT, "func(tophashes, triehashes *[16]uint8, tophash8, triehash8 uint8) uint16")
+		TEXT("FindHashesAndEmpties", NOSPLIT, "func(tophashes, triehashes *[16]uint8, tophash8, triehash8 uint8) (hashes, empties uint16)")
 		Pragma("noescape") // tophashes and triehashes have no need to escape
 
 		b1 := Mem{Base: Load(Param("tophashes"), GP64())}
 		b2 := Mem{Base: Load(Param("triehashes"), GP64())}
 		h1 := Load(Param("tophash8"), GP32())
 		h2 := Load(Param("triehash8"), GP32())
-		out := GP32()
+		hashmatches := GP32()
+		empties := GP32()
 
-		x0, x1, x2, x3 := XMM(), XMM(), XMM(), XMM()
+		xtophash, xtriehash, xtophashes, xtriehashes, xzero := XMM(), XMM(), XMM(), XMM(), XMM()
 
-		MOVD(h1, x0)
-		MOVD(h2, x2)
+		MOVD(h1, xtophash)
+		MOVD(h2, xtriehash)
 
-		PXOR(x1, x1)
-		PSHUFB(x1, x0)
-		PSHUFB(x1, x2)
+		PXOR(xzero, xzero)
+		PSHUFB(xzero, xtophash)
+		PSHUFB(xzero, xtriehash)
 
-		MOVOU(b1, x1)
-		MOVOU(b2, x3)
+		MOVOU(b1, xtophashes)
+		MOVOU(b2, xtriehashes)
 
-		PCMPEQB(x1, x0)
-		PCMPEQB(x3, x2)
-		PAND(x2, x0)
+		PCMPEQB(xtophashes, xtophash)
+		PCMPEQB(xtriehashes, xtriehash)
+		PAND(xtophash, xtriehash)
 
-		PMOVMSKB(x0, out)
+		PMOVMSKB(xtriehash, hashmatches)
 
-		Store(out.As16(), ReturnIndex(0))
+		Comment("Then the empties")
+		PCMPEQB(xzero, xtophashes)
+		PMOVMSKB(xtophashes, empties)
+
+		Store(hashmatches.As16(), ReturnIndex(0))
+		Store(empties.As16(), ReturnIndex(1))
 		RET()
 	}
 
@@ -52,49 +58,40 @@ func main() {
 		b1 := Mem{Base: Load(Param("tophashes"), GP64())}
 		out := GP32()
 
-		x0, x1 := XMM(), XMM()
-		MOVOU(b1, x1)
+		xhashes, xzero := XMM(), XMM()
+		MOVOU(b1, xhashes)
 
-		PXOR(x0, x0)
-		PCMPEQB(x1, x0)
+		PXOR(xzero, xzero)
+		PCMPEQB(xzero, xhashes)
 
-		PMOVMSKB(x0, out)
+		PMOVMSKB(xhashes, out)
 
 		Store(out.As16(), ReturnIndex(0))
 		RET()
 	}
 
 	{
-		// To figure out the slots with a present value (not empty or
-		// tombstone), we remember that only for empty and tombstone marker
-		// tophashes the lowest 7 bits are all zeros.
-		//
-		// So we mask out the 8th bit and see if the remaining byte is >0.
-		// TODO: Is there a better way?
-		TEXT("FindPresent", NOSPLIT, "func(tophashes *[16]uint8) uint16")
-		Pragma("noescape") // tophashes has no need to escape
+		TEXT("FindBytesWhereBitsRemainSetAfterApplyingThisMask", NOSPLIT, "func(hashes *[16]uint8, mask uint8) uint16")
+		Pragma("noescape") // hashes has no need to escape
 
-		b1 := Mem{Base: Load(Param("tophashes"), GP64())}
+		b1 := Mem{Base: Load(Param("hashes"), GP64())}
+		mask := Load(Param("mask"), GP64())
 		out := GP32()
-		mask := GP64()
 
-		x0, x1 := XMM(), XMM()
+		xmask, xhashes, xzero := XMM(), XMM(), XMM()
 
-		MOVQ(U64(0b0111_1111), mask)
-		MOVQ(mask, x0)
+		MOVQ(mask, xmask)
 
-		PXOR(x1, x1)
-		PSHUFB(x1, x0)
+		PXOR(xzero, xzero)
+		PSHUFB(xzero, xmask)
 
-		MOVOU(b1, x1)
+		MOVOU(b1, xhashes)
 
-		// setup done
-		PAND(x1, x0)
-
-		PXOR(x1, x1)
-		PCMPGTB(x1, x0)
-
-		PMOVMSKB(x0, out)
+		Comment("Figure out the bytes where all bits are ZEROES after applying the mask, then invert the result")
+		PAND(xmask, xhashes)
+		PCMPEQB(xzero, xhashes)
+		PMOVMSKB(xhashes, out)
+		NOTL(out)
 
 		Store(out.As16(), ReturnIndex(0))
 		RET()

@@ -4,50 +4,57 @@
 
 #include "textflag.h"
 
-// func FindHashes(tophashes *[16]uint8, triehashes *[16]uint8, tophash8 uint8, triehash8 uint8) uint16
+// func FindHashesAndEmpties(tophashes *[16]uint8, triehashes *[16]uint8, tophash8 uint8, triehash8 uint8) (hashes uint16, empties uint16)
 // Requires: SSE2, SSSE3
-TEXT ·FindHashes(SB), NOSPLIT, $0-26
+TEXT ·FindHashesAndEmpties(SB), NOSPLIT, $0-28
 	MOVQ     tophashes+0(FP), AX
 	MOVQ     triehashes+8(FP), CX
 	MOVBLZX  tophash8+16(FP), DX
 	MOVBLZX  triehash8+17(FP), BX
 	MOVD     DX, X0
-	MOVD     BX, X2
-	PXOR     X1, X1
-	PSHUFB   X1, X0
-	PSHUFB   X1, X2
-	MOVOU    (AX), X1
+	MOVD     BX, X1
+	PXOR     X4, X4
+	PSHUFB   X4, X0
+	PSHUFB   X4, X1
+	MOVOU    (AX), X2
 	MOVOU    (CX), X3
-	PCMPEQB  X1, X0
-	PCMPEQB  X3, X2
-	PAND     X2, X0
-	PMOVMSKB X0, AX
-	MOVW     AX, ret+24(FP)
+	PCMPEQB  X2, X0
+	PCMPEQB  X3, X1
+	PAND     X0, X1
+	PMOVMSKB X1, AX
+
+	// Then the empties
+	PCMPEQB  X4, X2
+	PMOVMSKB X2, CX
+	MOVW     AX, hashes+24(FP)
+	MOVW     CX, empties+26(FP)
 	RET
 
 // func FindEmpty(tophashes *[16]uint8) uint16
 // Requires: SSE2
 TEXT ·FindEmpty(SB), NOSPLIT, $0-10
 	MOVQ     tophashes+0(FP), AX
-	MOVOU    (AX), X1
-	PXOR     X0, X0
+	MOVOU    (AX), X0
+	PXOR     X1, X1
 	PCMPEQB  X1, X0
 	PMOVMSKB X0, AX
 	MOVW     AX, ret+8(FP)
 	RET
 
-// func FindPresent(tophashes *[16]uint8) uint16
+// func FindBytesWhereBitsRemainSetAfterApplyingThisMask(hashes *[16]uint8, mask uint8) uint16
 // Requires: SSE2, SSSE3
-TEXT ·FindPresent(SB), NOSPLIT, $0-10
-	MOVQ     tophashes+0(FP), AX
-	MOVQ     $0x000000000000007f, CX
-	MOVQ     CX, X0
-	PXOR     X1, X1
-	PSHUFB   X1, X0
-	MOVOU    (AX), X1
-	PAND     X1, X0
-	PXOR     X1, X1
-	PCMPGTB  X1, X0
-	PMOVMSKB X0, AX
-	MOVW     AX, ret+8(FP)
+TEXT ·FindBytesWhereBitsRemainSetAfterApplyingThisMask(SB), NOSPLIT, $0-18
+	MOVQ    hashes+0(FP), AX
+	MOVBQZX mask+8(FP), CX
+	MOVQ    CX, X0
+	PXOR    X2, X2
+	PSHUFB  X2, X0
+	MOVOU   (AX), X1
+
+	// Figure out the bytes where all bits are ZEROES after applying the mask, then invert the result
+	PAND     X0, X1
+	PCMPEQB  X2, X1
+	PMOVMSKB X1, AX
+	NOTL     AX
+	MOVW     AX, ret+16(FP)
 	RET

@@ -1,4 +1,4 @@
-//go:build amd64 && nosimd
+//go:build !amd64 || nosimd
 
 package finnishtable
 
@@ -32,12 +32,14 @@ func (b *bucketmeta) Finder() bucketfinder {
 	}
 }
 
-func (b *bucketfinder) ProbeHashMatches(tophashProbe tophashprobe, triehashProbe triehashprobe) matchiter {
+func (b *bucketfinder) ProbeHashMatchesAndEmpties(tophashProbe tophashprobe, triehashProbe triehashprobe) (hashes, empties matchiter) {
 	// find (tophashMatches & triehashMatches)
 	// TODO: Try to abuse the specific values of tophashEmpty and
 	// tophashTombstone for speed just like findPresentTophash64 does
 	hashMatches := findZeros64((b.tophashes8le ^ uint64(tophashProbe)) | (b.triehashes8le ^ uint64(triehashProbe)))
-	return matchiter{hashMatches: hashMatches}
+	hashes.hashMatches = hashMatches
+	empties.hashMatches = findZeros64(b.tophashes8le)
+	return
 }
 
 func (b *bucketfinder) EmptySlots() matchiter {
@@ -57,6 +59,17 @@ func (b *bucketfinder) MakeTombstonesIntoEmpties(m *bucketmeta) {
 		slotInBucket := iter.Current()
 		m.tophash8[slotInBucket] = tophashEmpty
 	}
+}
+
+func (b *bucketfinder) GoesRightForBit(maskWithBitSet uint8) matchiter {
+	// We can find all entries that would go to the "right" for the given bit
+	// by also noticing that only for present (not empty or tombstone) entries
+	// the triehash bits can be non-zero. So we just find the triehash entries
+	// where the given bit is 1 and we know that entries there are also
+	// present.
+	const topbit = (math.MaxUint64 / 255) * 0b1000_0000
+	findBits := (math.MaxUint64 / 255) * uint64(maskWithBitSet)
+	return matchiter{hashMatches: (^findZeros64(b.triehashes8le & findBits)) & topbit}
 }
 
 type matchiter struct {
@@ -84,6 +97,14 @@ func (m *matchiter) Count() uint8 {
 	return uint8(bits.OnesCount64(m.hashMatches))
 }
 
+func (m *matchiter) AsBitmask() bucketBitmask {
+	return bucketBitmask(m.hashMatches)
+}
+
+func (m *matchiter) WithBitmaskExcluded(bm bucketBitmask) matchiter {
+	return matchiter{hashMatches: m.hashMatches &^ uint64(bm)}
+}
+
 func findZeros64(v uint64) uint64 {
 	const c1 = (math.MaxUint64 / 255) * 0b0111_1111
 	const topbit = (math.MaxUint64 / 255) * 0b1000_0000
@@ -99,7 +120,21 @@ func findPresentTophash64(v uint64) uint64 {
 	return ((v & c1) + c1) & topbit
 }
 
-func findZeros(bytes *[bucketSize]uint8) matchiter {
-	hashMatches := findZeros64(binary.LittleEndian.Uint64(bytes[:]))
-	return matchiter{hashMatches: hashMatches}
+type bucketBitmask uint64
+
+func (bm bucketBitmask) IsMarked(slot uint8) bool {
+	return (bm>>(slot*8))&0b1000_0000 > 0
+}
+
+func (bm *bucketBitmask) Mark(slot uint8) {
+	*bm |= 0b1000_0000 << (slot * 8)
+}
+
+func (bm bucketBitmask) FirstUnmarkedSlot() uint8 {
+	inv := ^uint64((bm >> 7) * 255)
+	return uint8(bits.TrailingZeros64(inv)) / 8
+}
+
+func (bm bucketBitmask) AsMatchiter() matchiter {
+	return matchiter{hashMatches: uint64(bm)}
 }

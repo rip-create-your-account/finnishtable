@@ -16,6 +16,9 @@ type (
 )
 
 func makeHashProbes(tophash8 tophash, triehash8 uint8) (tophashprobe, triehashprobe) {
+	// Imagine building the 128-bit XMM register here.
+	//     MOVD     tophash8, X_tophash8
+	//     PSHUFB   X_ZERO, X_tophash8
 	return tophashprobe(tophash8), triehashprobe(triehash8)
 }
 
@@ -25,9 +28,9 @@ func (b *bucketmeta) Finder() bucketfinder {
 	return bucketfinder{b}
 }
 
-func (b *bucketfinder) ProbeHashMatches(tophashProbe tophashprobe, triehashProbe triehashprobe) matchiter {
-	hashMatches := asm.FindHashes(&b.tophash8, &b.triehash8, uint8(tophashProbe), uint8(triehashProbe))
-	return matchiter{hashMatches: hashMatches}
+func (b *bucketfinder) ProbeHashMatchesAndEmpties(tophashProbe tophashprobe, triehashProbe triehashprobe) (hashes, empties matchiter) {
+	hashes.hashMatches, empties.hashMatches = asm.FindHashesAndEmpties(&b.tophash8, &b.triehash8, uint8(tophashProbe), uint8(triehashProbe))
+	return
 }
 
 func (b *bucketfinder) EmptySlots() matchiter {
@@ -36,7 +39,7 @@ func (b *bucketfinder) EmptySlots() matchiter {
 }
 
 func (b *bucketfinder) PresentSlots() matchiter {
-	hashMatches := asm.FindPresent(&b.tophash8)
+	hashMatches := asm.FindBytesWhereBitsRemainSetAfterApplyingThisMask(&b.tophash8, 0b0111_1111)
 	return matchiter{hashMatches: hashMatches}
 }
 
@@ -45,6 +48,16 @@ func (b *bucketfinder) MakeTombstonesIntoEmpties(m *bucketmeta) {
 	for ; matches.HasCurrent(); matches.Advance() {
 		b.tophash8[matches.Current()] = tophashEmpty
 	}
+}
+
+func (b *bucketfinder) GoesRightForBit(maskWithBitSet uint8) matchiter {
+	// We can find all entries that would go to the "right" for the given bit
+	// by also noticing that only for present (not empty or tombstone) entries
+	// the triehash bits can be non-zero. So we just find the triehash entries
+	// where the given bit is 1 and we know that entries there are also
+	// present.
+	hashMatches := asm.FindBytesWhereBitsRemainSetAfterApplyingThisMask(&b.triehash8, maskWithBitSet)
+	return matchiter{hashMatches: hashMatches}
 }
 
 type matchiter struct{ hashMatches uint16 }
@@ -62,18 +75,19 @@ func (m *matchiter) Advance() {
 	// unset the lowest set bit
 	// BLSR — Reset Lowest Set Bit - works only on 32 or 64 bit integers (and
 	// requires compiling with GOAMD64=v3)
-	h := uint32(m.hashMatches)
-	m.hashMatches = uint16(h & (h - 1))
+	m.hashMatches = m.hashMatches & (m.hashMatches - 1)
 }
 
 func (m *matchiter) Count() uint8 {
 	return uint8(bits.OnesCount16(m.hashMatches))
 }
 
-func findZeros(bytes *[bucketSize]uint8) matchiter {
-	// TODO: Alignment of "bytes" is spooky? Does it matter?
-	hashMatches := asm.FindEmpty(bytes)
-	return matchiter{hashMatches: hashMatches}
+func (m *matchiter) AsBitmask() bucketBitmask {
+	return bucketBitmask(m.hashMatches)
+}
+
+func (m *matchiter) WithBitmaskExcluded(bm bucketBitmask) matchiter {
+	return matchiter{hashMatches: m.hashMatches &^ uint16(bm)}
 }
 
 func findBytesInKindaSlowWay(bytes *[bucketSize]uint8, b uint8) matchiter {
@@ -81,6 +95,24 @@ func findBytesInKindaSlowWay(bytes *[bucketSize]uint8, b uint8) matchiter {
 	// matching bytes into zeros and pass that to FindEmpty()
 	// TODO: Alignment of "bytes" is spooky? Does it matter?
 	var fakeTriehashes [16]uint8 // fake triehashes that always match with '0'
-	hashMatches := asm.FindHashes(bytes, &fakeTriehashes, b, 0)
+	hashMatches, _ := asm.FindHashesAndEmpties(bytes, &fakeTriehashes, b, 0)
 	return matchiter{hashMatches: hashMatches}
+}
+
+type bucketBitmask uint16
+
+func (bm bucketBitmask) IsMarked(slot uint8) bool {
+	return (bm>>slot)&1 == 1
+}
+
+func (bm *bucketBitmask) Mark(slot uint8) {
+	*bm |= 1 << slot
+}
+
+func (bm bucketBitmask) FirstUnmarkedSlot() uint8 {
+	return uint8(bits.TrailingZeros16(^uint16(bm)))
+}
+
+func (bm bucketBitmask) AsMatchiter() matchiter {
+	return matchiter{hashMatches: uint16(bm)}
 }

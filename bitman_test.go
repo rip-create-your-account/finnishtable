@@ -18,7 +18,7 @@ func TestFindHashes(t *testing.T) {
 		tophashProbe, triehashProbe := makeHashProbes(b, b)
 
 		finder := meta.Finder()
-		present := finder.ProbeHashMatches(tophashProbe, triehashProbe)
+		present, _ := finder.ProbeHashMatchesAndEmpties(tophashProbe, triehashProbe)
 		if present.Count() != uint8(len(meta.tophash8)) {
 			t.Fatalf("did not get present for %v", b)
 		}
