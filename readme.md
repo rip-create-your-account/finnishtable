@@ -12,6 +12,8 @@
    to do extendible hashing but better than I did. (Please don't just copy and
    pasta the ideas presented here or I will call you a fraud.)
  - it just works
+
+[The perfect hash variant of this map](perfect_readme.md).
  
 ## Tell me lies
 
