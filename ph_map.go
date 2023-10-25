@@ -1,15 +1,21 @@
 package finnishtable
 
 import (
+	"encoding/binary"
+	"fmt"
+	"math"
 	"math/bits"
 	"unsafe"
-
-	"github.com/rip-create-your-account/finnishtable/asm"
 )
 
-// TODO: Specialize fixTophash for ph hash. We have no tombstones so only 0 is
-// reserved as a special value. That would require modifying my lovely assembly
-// routines so I won't bother for now.
+// TODO: Specialize assembly for the needs for this data structure. That would
+// require modifying my lovely assembly routines so I won't bother for now. I
+// prefer waiting the 10+ years until Go has SIMD intrinsics.
+
+func fixTophashForPh(hash uint8) tophash {
+	// We have no reserved values
+	return hash
+}
 
 type kv[K comparable, V any] struct {
 	key   K
@@ -28,38 +34,10 @@ func (e *phtrieEntry) bucketsOffset() uint32 {
 }
 
 func (e *phtrieEntry) hashrot() uint32 {
-	// So... bits.RotateLeft only looks at the lower 6 bits. So basically I'm
-	// just gonna not mask off the upper bits. It's kinda nice that
-	// bucketsOffset is just a shr instruction and this one is nothing.
+	// So... bits.RotateLeft/shifts only looks at the lower 6 bits. So
+	// basically I'm just gonna not mask off the upper bits. It's kinda nice
+	// that bucketsOffset is just a shr instruction and this one is nothing.
 	return e._bucketsOffset_hashrot
-}
-
-type phbucketmeta struct {
-	// top 8-bits of the hash adjusted with fixTophash()
-	tophash8 [bucketSize]tophash
-}
-
-type phbucket struct {
-	phbucketmeta
-	kvsOffset uint32
-}
-
-type phbucketfinder struct{ *phbucketmeta }
-
-func (b *phbucketmeta) Finder() phbucketfinder {
-	return phbucketfinder{b}
-}
-
-var zeroes16 [16]uint8
-
-func (b *phbucketfinder) ProbeHashMatchesAndEmpties(tophashProbe tophashprobe) (hashes, empties matchiter) {
-	hashes.hashMatches, empties.hashMatches = asm.FindHashesAndEmpties(&b.tophash8, &zeroes16, uint8(tophashProbe), 0)
-	return
-}
-
-func (b *phbucketfinder) PresentSlots() matchiter {
-	hashMatches := asm.FindBytesWhereBitsRemainSetAfterApplyingThisMask(&b.tophash8, 0b0111_1111)
-	return matchiter{hashMatches: hashMatches}
 }
 
 // A perfect hashing Finnish hash table, or phfish for short. Stores key-value pairs.
@@ -72,12 +50,12 @@ type PhFishTable[K comparable, V any] struct {
 	// the metas for that block. It would also make the phbuckets smaller as
 	// they wouldn't need to carry a pointer to the kvs.
 	//
-	// eg. {[16]byte, kv0, kv1, kv2, kv3, kv4, [16]byte, kv0, kv1, [16]byte,
-	// kv0, kv1, kv2, ... etc}
+	// eg. {HDR0, tb0, tb1, tb2, tb3, tb4, kv0, kv1, kv2, kv3, kv4, HDR1, tb0,
+	// tb1, tb2, kv0, kv1, kv2, HDR2, tb0, tb1, ...}
 	//
 	// Less cache misses all around, l1, l2 ... tlb, etc...
 	allKvs   []kv[K, V]
-	allMetas []phbucket
+	allMetas []uint8 // "encoded" (bucket header + bucket tophashes)s. See Get() for how to decode.
 
 	seed uintptr
 }
@@ -93,25 +71,35 @@ func (m *PhFishTable[K, V]) Get(k K) (V, bool) {
 
 		sm := &trie[hash&uintptr(len(trie)-1)]
 
-		rotatedHash := bits.RotateLeft(uint(hash), -int(sm.hashrot()))
-		tophash8 := fixTophash(uint8(rotatedHash))
+		metastart := (*[4 + bucketSize]byte)(m.allMetas[sm.bucketsOffset():])
 
+		hdr := binary.LittleEndian.Uint32(metastart[0:])
+		kvsOffset := hdr
+		bucketmetas := (*[bucketSize]byte)(metastart[4 : 4+bucketSize])
+
+		tophash8 := fixTophashForPh(uint8(hash >> (sm.hashrot() % 64)))
 		tophashProbe, _ := makeHashProbes(tophash8, 0)
-
-		bucketmetas := &m.allMetas[sm.bucketsOffset()]
-		kvsOffset := bucketmetas.kvsOffset
 
 		// NOTE: The nice thing about having to find the matching tophash is
 		// the case when there's none - because the key is not in the map! So
 		// with a good likelihood we don't have to waste our time comparing the
 		// keys. Goddamn is this shit practical and nice and stuff.
-		finder := bucketmetas.Finder()
-		hashMatches, _ := finder.ProbeHashMatchesAndEmpties(tophashProbe)
+		finder := phbucketFinderFrom(bucketmetas)
+		hashMatches := finder.ProbeHashMatches(tophashProbe)
 		if hashMatches.HasCurrent() {
-			idx := hashMatches.Current()
-			kv := &m.allKvs[kvsOffset+uint32(idx)]
-			if kv.key == k {
-				return kv.value, true
+			// NOTE: We are potentially probing to the next bucket, but here we
+			// take the earliest match so there's no room for failure. Well...
+			// There's room for failure if we didn't also check the key
+			// equality, but we do. If we don't want to check for the key then
+			// we might have to include the size of the bucket in the bucket
+			// metadata so that we know not to match beyond that.
+			slotInBucket := hashMatches.Current()
+			idx := uint(kvsOffset) + uint(slotInBucket)
+			if idx < uint(len(m.allKvs)) { // rare branch miss only for last bucket and if tophash8(k) == 0
+				kv := &m.allKvs[idx]
+				if kv.key == k {
+					return kv.value, true
+				}
 			}
 		}
 	}
@@ -120,9 +108,57 @@ func (m *PhFishTable[K, V]) Get(k K) (V, bool) {
 	return zerov, false
 }
 
+// Returns the unique integer for this key in [0, len(kvs)). Returns -1 if k is
+// not in the set
+func (m *PhFishTable[K, V]) GetInt(k K) int {
+	trie := m.trie
+	if len(trie) > 0 {
+		hash := m.hasher(noescape(unsafe.Pointer(&k)), m.seed)
+
+		sm := &trie[hash&uintptr(len(trie)-1)]
+
+		metastart := (*[4 + bucketSize]byte)(m.allMetas[sm.bucketsOffset():])
+
+		hdr := binary.LittleEndian.Uint32(metastart[0:])
+		kvsOffset := hdr
+		bucketmetas := (*[bucketSize]byte)(metastart[4 : 4+bucketSize])
+
+		tophash8 := fixTophashForPh(uint8(hash >> (sm.hashrot() % 64)))
+		tophashProbe, _ := makeHashProbes(tophash8, 0)
+
+		// NOTE: The nice thing about having to find the matching tophash is
+		// the case when there's none - because the key is not in the map! So
+		// with a good likelihood we don't have to waste our time comparing the
+		// keys. Goddamn is this shit practical and nice and stuff.
+		finder := phbucketFinderFrom(bucketmetas)
+		hashMatches := finder.ProbeHashMatches(tophashProbe)
+		if hashMatches.HasCurrent() {
+			// NOTE: We are potentially probing to the next bucket, but here we
+			// take the earliest match so there's no room for failure. Well...
+			// There's room for failure if we didn't also check the key
+			// equality, but we do. If we don't want to check for the key then
+			// we might have to include the size of the bucket in the bucket
+			// metadata so that we know not to match beyond that.
+			slotInBucket := hashMatches.Current()
+			idx := uint(kvsOffset) + uint(slotInBucket)
+			if idx < uint(len(m.allKvs)) { // rare branch miss only for last bucket and if tophash8(k) == 0
+				kv := &m.allKvs[idx]
+				if kv.key == k {
+					return int(idx)
+				}
+			}
+		}
+	}
+
+	return -1
+}
+
 func MakePerfectWithUnsafeHasher[K comparable, V any](hasher func(key unsafe.Pointer, seed uintptr) uintptr, kvs []kv[K, V]) *PhFishTable[K, V] {
 	if len(kvs) == 0 {
 		return new(PhFishTable[K, V])
+	}
+	if len(kvs) > math.MaxUint32 {
+		panic("too many keys")
 	}
 
 	builder := new(phBuilder[K, V])
@@ -135,7 +171,8 @@ newSeed:
 
 		{
 			const maxEntriesPerMap = bucketSize
-			numMaps := len(kvs) / maxEntriesPerMap
+			adjustedSize := len(kvs) * 16 / 11 // 11/16 is the load-factor that we hit consistently
+			numMaps := adjustedSize / maxEntriesPerMap
 			numMaps = 1 << bits.Len(uint(numMaps))
 
 			initialDepth := uint8(bits.TrailingZeros(uint(numMaps)))
@@ -162,6 +199,8 @@ newSeed:
 		//
 		// This doesn't really make the lookups faster but in the best case
 		// reduces metadata size by like ~5%. Worth it? No, I don't think så.
+		// The main benefit would come from it reducing the size of the trie
+		// but that's very unlikely to happen.
 		builder.compactTheMaps()
 
 		m := new(PhFishTable[K, V])
@@ -169,12 +208,15 @@ newSeed:
 		m.seed = builder.seed
 
 		var numTotalBuckets int
+		var lastBucketPop int
 		builder.iterateMapsWithRevisiting(func(i, firstInstance int, sm *phBuilderSmolMap[K, V]) {
-			add := 1
 			if i != firstInstance {
-				add = 0
+				return
 			}
-			numTotalBuckets += add
+
+			numTotalBuckets++
+
+			lastBucketPop = int(sm.pop)
 		})
 
 		// In the final trie we pack bucket offset to a 26-bit integer.
@@ -188,8 +230,13 @@ newSeed:
 			panic("too many kv pairs, sorry :-|")
 		}
 
+		// Calculate size for allmetas and ensure that we can do a 16-byte read
+		// even for the last bucket
+		encodedSize := numTotalBuckets*4 + len(kvs)*1
+		encodedSize += bucketSize - lastBucketPop
+
 		m.trie = make([]phtrieEntry, len(builder.trie))
-		m.allMetas = make([]phbucket, numTotalBuckets)
+		m.allMetas = make([]uint8, encodedSize)
 		m.allKvs = make([]kv[K, V], len(kvs))
 
 		var bucketsOff int
@@ -209,35 +256,58 @@ newSeed:
 				_bucketsOffset_hashrot: uint32(bucketsOff)<<6 | uint32(sm.hashrot),
 			}
 
-			dstMetas := &m.allMetas[bucketsOff]
-			dstMetas.kvsOffset = uint32(kvsOff)
+			if kvsOff >= 1<<27 {
+				panic("oops")
+			}
 
-			finder := sm.bucketmetas.Finder()
-			presents := finder.PresentSlots()
-			var nextSlot int
-			for ; presents.HasCurrent(); presents.Advance() {
-				slotInBucket := presents.Current()
+			dstMetas := m.allMetas[bucketsOff:]
+
+			// first comes the 32-bits of header data
+			binary.LittleEndian.PutUint32(dstMetas, uint32(kvsOff))
+
+			// then the tophashes
+			dstHashes := dstMetas[4:][:sm.pop]
+			for slotInBucket := range sm.buckets[:sm.pop] {
 				kvIndex := sm.buckets[slotInBucket]
+
+				hash := builder.fullHashes[kvIndex]
+				tophash8 := fixTophashForPh(uint8(hash >> (sm.hashrot % 64)))
+				dstHashes[slotInBucket] = tophash8
 
 				m.allKvs[kvsOff] = builder.kvs[kvIndex]
 				kvsOff++
-
-				// Pack the tophashes compactly to the start. They could be
-				// scattered around the array if there has been any splitting
-				// going on. We must do this so that the hash always matches in
-				// an index that is in [0, sm.num_populated_entries)
-				//
-				// TODO: I'm pretty sure that there's a SIMD instruction for
-				// this and this could be done outside the loop.
-				dstMetas.tophash8[nextSlot] = sm.bucketmetas.tophash8[slotInBucket]
-				nextSlot++
 			}
-
-			bucketsOff += 1
+			bucketsOff += 4 + int(sm.pop)
 		})
 
 		return m
 	}
+}
+
+func dumpPhDepths[K comparable, V any](m *phBuilder[K, V]) {
+	depths := make(map[uint8]int, 64)
+	m.iterateMapsWithRevisiting(func(i, f int, sm *phBuilderSmolMap[K, V]) {
+		if i == f {
+			depths[sm.depth]++
+		}
+	})
+	var maxDepth uint8
+	var minDepth uint8 = math.MaxUint8
+	for depth := range depths {
+		if depth > maxDepth {
+			maxDepth = depth
+		}
+		if depth < minDepth {
+			minDepth = depth
+		}
+	}
+
+	println("depths:	level	maps")
+	fmt.Printf("	[..]	0\n")
+	for i := minDepth; i <= maxDepth; i++ {
+		fmt.Printf("	[%02v]	%v\n", i, depths[i])
+	}
+	fmt.Printf("	[..]	0\n")
 }
 
 type phBuilder[K comparable, V any] struct {
@@ -252,11 +322,28 @@ type phBuilder[K comparable, V any] struct {
 	// should be fast.
 }
 
+type bitvector [4]uint64
+
+func (bv *bitvector) Toggle(i uint8) {
+	bit := uint64(1) << (i % 64)
+	bv[i>>6] ^= bit
+}
+
+func (bv *bitvector) IsSet(i uint8) bool {
+	bit := uint64(1) << (i % 64)
+	return bv[i>>6]&bit != 0
+}
+
 type phBuilderSmolMap[K comparable, V any] struct {
-	// NOTE: len(bucketmetas) is not always a power-of-two
-	bucketmetas phbucketmeta
-	// NOTE: len(buckets) is not always a power-of-two
-	buckets [bucketSize]int
+	buckets [bucketSize]uint32
+	// keeps track of the present tophashes in [0, 255]
+	//
+	// NOTE: With proper SIMD you probably just want to store the 16 tophashes
+	// with pop count. It would use less space and probably would be faster.
+	// Especially considering that we wouldn't have to do work to find the
+	// intruder when we have a tophash collision.
+	bitvector bitvector
+	pop       uint8 // <= 16
 
 	depth   uint8 // <= 64
 	hashrot uint8 // <= 56
@@ -281,58 +368,41 @@ func (h *phBuilder[K, V]) compactTheMaps() {
 				return
 			}
 
-			firstFinder := firstMap.bucketmetas.Finder()
-			secondFinder := secondMap.bucketmetas.Finder()
-
-			firstPresents := firstFinder.PresentSlots()
-			secondPresents := secondFinder.PresentSlots()
-			if totalPop := firstPresents.Count() + secondPresents.Count(); totalPop > bucketSize {
+			if totalPop := firstMap.pop + secondMap.pop; totalPop > bucketSize {
 				// No room for merging
 				return
 			}
 
 			smallerMap, biggerMap := firstMap, secondMap
-			if secondPresents.Count() < firstPresents.Count() {
+			if secondMap.pop < firstMap.pop {
 				smallerMap, biggerMap = secondMap, firstMap
 			}
 
-			finder := smallerMap.bucketmetas.Finder()
-			presents := finder.PresentSlots()
-
+			// create a copy that we can safely mutate
 			mergedMap := *biggerMap
 
+			// TODO: With proper SIMD there's likely a better algorithm for
+			// this. Real 256-bit bitvector would make certain things easier.
 		insertloop:
-			for ; presents.HasCurrent(); presents.Advance() {
-				slotInBucket := presents.Current()
+			for slotInBucket := range smallerMap.buckets[:smallerMap.pop] {
 				kvIndex := smallerMap.buckets[slotInBucket]
 				hash := h.fullHashes[kvIndex]
 
-				tophash8 := fixTophash(uint8(bits.RotateLeft(uint(hash), -int(mergedMap.hashrot))))
-				tophashProbe, _ := makeHashProbes(tophash8, 0)
-
-				mergedFinder := mergedMap.bucketmetas.Finder()
-				matches, empties := mergedFinder.ProbeHashMatchesAndEmpties(tophashProbe)
-				if !matches.HasCurrent() {
-					if !empties.HasCurrent() {
+				tophash8 := fixTophashForPh(uint8(hash >> (mergedMap.hashrot % 64)))
+				if !mergedMap.bitvector.IsSet(tophash8) {
+					if mergedMap.pop >= bucketSize {
 						panic("oops")
 					}
 
-					idx := empties.Current()
+					idx := mergedMap.pop
 					mergedMap.buckets[idx] = kvIndex
-					mergedMap.bucketmetas.tophash8[idx] = tophash8
+					mergedMap.bitvector.Toggle(tophash8)
+					mergedMap.pop++
 					continue insertloop
 				}
 
-				newHashrot := mergedMap.hashrot
-				for i := 0; i < 8; i++ {
-					newHashrot -= 4
-					if newHashrot < 24 {
-						// don't delve too deep into the triehash bits
-						newHashrot = 56
-					}
-					if ok := h.rehashAndAdd(&mergedMap, newHashrot, hash, kvIndex); ok {
-						continue insertloop
-					}
+				if ok := h.findWorkingHashrotAndAdd(&mergedMap, hash, kvIndex); ok {
+					continue insertloop
 				}
 
 				// above loop failed to merge :-(
@@ -362,49 +432,61 @@ reduceloop:
 	}
 }
 
-func (h *phBuilder[K, V]) rehashAndAdd(m *phBuilderSmolMap[K, V], newrot uint8, frenHash uintptr, frenKvIndex int) bool {
-	tophash8 := fixTophash(uint8(bits.RotateLeft(uint(frenHash), -int(newrot))))
-
-	var dstmetas phbucketmeta
-	var dstbuckets [bucketSize]int
-	dstmetas.tophash8[0] = tophash8
-	dstbuckets[0] = frenKvIndex
-	nextFreeInDst := 1
-
-	bucketmetas := &m.bucketmetas
-	bucket := &m.buckets
-
-	finder := bucketmetas.Finder()
-
-	presents := finder.PresentSlots()
-
-	for ; presents.HasCurrent(); presents.Advance() {
-		slotInBucket := presents.Current()
-		hash := h.fullHashes[bucket[slotInBucket]]
-		tophash8 := fixTophash(uint8(bits.RotateLeft(uint(hash), -int(newrot))))
-		tophash8Probe, _ := makeHashProbes(tophash8, 0)
-
-		finder := dstmetas.Finder()
-		matches, _ := finder.ProbeHashMatchesAndEmpties(tophash8Probe)
-		if matches.HasCurrent() {
-			return false
+func (h *phBuilder[K, V]) findWorkingHashrotAndAdd(m *phBuilderSmolMap[K, V], frenHash uintptr, frenKvIndex uint32) bool {
+	newrot := m.hashrot
+nextrot:
+	for i := 0; i < 8; i++ {
+		newrot -= 4
+		if newrot <= m.depth {
+			// Don't delve too deep into the triehash bits as they are equal
+			// for all entries in the smol map
+			newrot = 56
 		}
 
-		dstmetas.tophash8[nextFreeInDst] = tophash8
-		dstbuckets[nextFreeInDst] = bucket[slotInBucket]
-		nextFreeInDst++
+		var bv bitvector
+
+		// Try to re-slot the original values with the new hashrot
+		for slotInBucket := range m.buckets[:m.pop] {
+			hash := h.fullHashes[m.buckets[slotInBucket]]
+			tophash8 := fixTophashForPh(uint8(hash >> (newrot % 64)))
+
+			// NOTE: One would assume that here the compiler would use the BTS
+			// instruction and check the carry flag to see the previous value
+			// for the bit. But apparently all compilers shit on the
+			// (BTS+carry) combo. How come? I want to see some of that BTS+JC
+			// action.
+			if bv.IsSet(tophash8) {
+				continue nextrot
+			}
+			bv.Toggle(tophash8)
+		}
+
+		// Then try to add the new one
+		{
+			tophash8 := fixTophashForPh(uint8(frenHash >> (newrot % 64)))
+			if bv.IsSet(tophash8) {
+				continue nextrot
+			}
+
+			// take the first free slot for it
+			freeSlotForInsert := m.pop
+			bv.Toggle(tophash8)
+			m.buckets[freeSlotForInsert] = frenKvIndex
+			m.pop++
+		}
+
+		m.bitvector = bv
+		m.hashrot = newrot
+		return true
 	}
 
-	m.bucketmetas = dstmetas
-	m.buckets = dstbuckets
-	m.hashrot = newrot
-
-	return true
+	return false
 }
 
 func (m *phBuilder[K, V]) PutAll(kvs []kv[K, V]) bool {
 kvsLoop:
-	for kvIndex := range kvs {
+	for _kvIndex := range kvs {
+		kvIndex := uint32(_kvIndex)
 		k := &kvs[kvIndex].key
 
 		hash := m.hasher(noescape(unsafe.Pointer(k)), m.seed)
@@ -420,45 +502,32 @@ kvsLoop:
 
 			sm := trie[trieSlot]
 
-			mapmetas := &sm.bucketmetas
-			mapbuckets := &sm.buckets
+			tophash8 := fixTophashForPh(uint8(hash >> (sm.hashrot % 64)))
 
-			tophash8 := fixTophash(uint8(bits.RotateLeft(uint(hash), -int(sm.hashrot))))
-
-			tophashProbe, _ := makeHashProbes(tophash8, 0)
-
-			bucketmetas := mapmetas
-			bucket := mapbuckets
-
-			finder := bucketmetas.Finder()
-			hashMatches, empties := finder.ProbeHashMatchesAndEmpties(tophashProbe)
-			if hashMatches.HasCurrent() {
+			if sm.bitvector.IsSet(tophash8) {
 				// oh nyoooo... A tophash collision! Perhaps even a full hash
 				// collision! Test it.
-				idx := hashMatches.Current()
-				if m.fullHashes[bucket[idx]] == hash {
-					if m.kvs[bucket[idx]].key == *k {
-						panic("TODO?")
+
+				// Loop through all entries to find the intruder
+				for slotInBucket := range sm.buckets[:sm.pop] {
+					otherhash := m.fullHashes[sm.buckets[slotInBucket]]
+					if otherhash == hash {
+						if m.kvs[sm.buckets[slotInBucket]].key == *k {
+							panic("TODO?")
+						}
+						// Two keys share the same hash... Shit!
+						return false
 					}
-					// Two keys share the same hash... Shit!
-					return false
 				}
 
-				if empties.HasCurrent() {
+				if sm.pop < bucketSize {
 					// WE WILL NOT TOLERATE SPLITTING IF WE HAVE EMPTY SLOTS
 					//
 					// ... also, I would really like to have my 128-bit hash
 					// values right now.
-					newHashrot := sm.hashrot
-					for i := 0; i < 8; i++ {
-						newHashrot -= 4
-						if newHashrot < 24 {
-							// don't delve too deep into the triehash bits
-							newHashrot = 56
-						}
-						if ok := m.rehashAndAdd(sm, newHashrot, hash, kvIndex); ok {
-							continue kvsLoop
-						}
+
+					if ok := m.findWorkingHashrotAndAdd(sm, hash, kvIndex); ok {
+						continue kvsLoop
 					}
 				}
 
@@ -467,10 +536,11 @@ kvsLoop:
 				continue retryloop
 			}
 
-			if empties.HasCurrent() {
-				idx := empties.Current()
-				bucket[idx] = kvIndex
-				bucketmetas.tophash8[idx] = tophash8
+			if sm.pop < bucketSize {
+				idx := sm.pop
+				sm.buckets[idx] = kvIndex
+				sm.bitvector.Toggle(tophash8)
+				sm.pop++
 				continue kvsLoop
 			}
 
@@ -512,7 +582,7 @@ func (h *phBuilder[K, V]) split(m *phBuilderSmolMap[K, V]) (*phBuilderSmolMap[K,
 		panic("depth overflow")
 	}
 
-	oldDepthBit := bits.RotateLeft64(1, int(m.depth))
+	oldDepthBit := uint64(1) << (m.depth % 64)
 
 	m.depth++
 
@@ -523,33 +593,28 @@ func (h *phBuilder[K, V]) split(m *phBuilderSmolMap[K, V]) (*phBuilderSmolMap[K,
 	right.depth = m.depth
 	right.hashrot = m.hashrot
 
-	var nextFreeInRight uint8
-
-	bucketmetas := &m.bucketmetas
-	bucket := &m.buckets
-
-	finder := bucketmetas.Finder()
-
-	presents := finder.PresentSlots()
-
 	// Move righties to the right map
-	for ; presents.HasCurrent(); presents.Advance() {
-		slotInBucket := presents.Current()
-		hash := h.fullHashes[bucket[slotInBucket]]
+	for slotInBucket := range left.buckets[:left.pop] {
+		hash := h.fullHashes[left.buckets[slotInBucket]]
+		tophash8 := fixTophashForPh(uint8(hash >> (left.hashrot % 64)))
 		if goesRight := hash & uintptr(oldDepthBit); goesRight == 0 {
+			// we want to keep our entries at the head of the array, so as we
+			// remove righties we leave gaps, here we fill them
+			moveto := slotInBucket - int(right.pop)
+			left.buckets[moveto] = left.buckets[slotInBucket]
 			continue
 		}
 
-		dstmetas := &right.bucketmetas
-		dstbuckets := &right.buckets
-		dstmetas.tophash8[nextFreeInRight] = bucketmetas.tophash8[slotInBucket]
-		dstbuckets[nextFreeInRight] = bucket[slotInBucket]
-		nextFreeInRight++
+		nextFreeInRight := right.pop
+		right.buckets[nextFreeInRight] = left.buckets[slotInBucket]
+		right.pop++
+		right.bitvector.Toggle(tophash8)
 
 		// Zero the slot left behind. Only setting the hashes is strictly necessary
-		bucketmetas.tophash8[slotInBucket] = 0
-		bucket[slotInBucket] = 0
+		left.bitvector.Toggle(tophash8)
 	}
+
+	left.pop -= right.pop
 
 	return left, right
 }
@@ -560,7 +625,7 @@ func (m *phBuilder[K, V]) iterateMapsWithRevisiting(iter func(int, int, *phBuild
 		triehash := i
 
 		// Did we visit this map already? Eerily similar to the logic elsewhere ;)
-		hibi := bits.RotateLeft64(1, int(sm.depth))
+		hibi := uint64(1) << (sm.depth % 64)
 		firstInstance := int((uint64(triehash) & (hibi - 1)))
 
 		iter(i, firstInstance, sm)

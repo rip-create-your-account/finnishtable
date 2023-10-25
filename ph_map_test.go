@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -57,6 +58,7 @@ func TestPhMap(t *testing.T) {
 				t.Fatalf("want %v got %v", len(kvs), m.Len())
 			}
 
+			seenInts := make([]bool, size)
 			for k := 0; k < size; k++ {
 				v, ok := m.Get(int64(k))
 				if !ok {
@@ -64,6 +66,33 @@ func TestPhMap(t *testing.T) {
 				}
 				if v != int64(k) {
 					t.Fatalf("wrong value for key %v, want %v got %v", k, k, v)
+				}
+				integer := m.GetInt(int64(k))
+				if uint(integer) >= uint(size) {
+					t.Fatalf("bad int for key %v, got %v", k, integer)
+				}
+
+				// check for GetInt duplicates
+				if seenInts[integer] {
+					t.Fatalf("duplicate %v", integer)
+				}
+				seenInts[integer] = true
+			}
+
+			// then some bad keys
+			numBadKeys := size
+			if numBadKeys < 1000 {
+				numBadKeys = 1000
+			}
+
+			for k := size; k < size+numBadKeys; k++ {
+				v, ok := m.Get(int64(k))
+				if ok {
+					t.Fatalf("matched key %v=%v", k, v)
+				}
+				integer := m.GetInt(int64(k))
+				if integer != -1 {
+					t.Fatalf("wrong int for key %v, want %v got %v", k, -1, integer)
 				}
 			}
 		})
@@ -83,18 +112,32 @@ func BenchmarkPhConstruct(b *testing.B) {
 			}
 
 			b.ResetTimer()
+
 			var m *PhFishTable[int64, int64]
+			var min time.Duration = math.MaxInt64
+			start := time.Now()
+			lastSince := time.Since(start)
 			for j := 0; j < b.N; j++ {
 				m = MakePerfectWithUnsafeHasher[int64, int64](hasher, kvs)
+
+				// retardo patronum!
+				since := time.Since(start)
+				d := since - lastSince
+				if d < min {
+					min = d
+				}
+				lastSince = since
 			}
 			b.StopTimer()
 
 			b.ReportMetric((float64(b.Elapsed()))/float64(b.N*size), "ns/elem")
-			b.ReportMetric((float64(b.Elapsed().Milliseconds()))/float64(b.N), "ms/map")
 
 			stats := phMapMemoryStats(m)
 			bf := float64(stats.OccupiedBytes) / float64(stats.TotalSizeInBytes)
-			b.ReportMetric(bf, "xbytes-factor")
+			esz := unsafe.Sizeof(m.allKvs[0])
+			be := (float64(esz)/bf - float64(esz)) * 8
+			b.ReportMetric(be, "bits/elem")
+			b.ReportMetric(float64(min.Nanoseconds()), "ns/fastest")
 		})
 	}
 }
@@ -116,10 +159,7 @@ func BenchmarkPhLookup(b *testing.B) {
 			b.ResetTimer()
 			for j := 0; j < b.N; j++ {
 				for i := 0; i < size; i++ {
-					v, ok := m.Get(int64(i))
-					if v != int64(i) || !ok {
-						b.Fatal(v, i, ok)
-					}
+					m.Get(int64(i))
 				}
 			}
 			b.StopTimer()
@@ -144,30 +184,4 @@ func phMapMemoryStats[K comparable, V any](m *PhFishTable[K, V]) MemoryStats {
 		OccupiedBytes:    uint64(occupiedBytes),
 		TotalSizeInBytes: uint64(selfSize + totalMapsSizeInBytes),
 	}
-}
-
-func dumpPhDepths[K comparable, V any](m *phBuilder[K, V]) {
-	depths := make(map[uint8]int, 64)
-	m.iterateMapsWithRevisiting(func(i, f int, sm *phBuilderSmolMap[K, V]) {
-		if i == f {
-			depths[sm.depth]++
-		}
-	})
-	var maxDepth uint8
-	var minDepth uint8 = math.MaxUint8
-	for depth := range depths {
-		if depth > maxDepth {
-			maxDepth = depth
-		}
-		if depth < minDepth {
-			minDepth = depth
-		}
-	}
-
-	println("depths:	level	maps")
-	fmt.Printf("	[..]	0\n")
-	for i := minDepth; i <= maxDepth; i++ {
-		fmt.Printf("	[%02v]	%v\n", i, depths[i])
-	}
-	fmt.Printf("	[..]	0\n")
 }

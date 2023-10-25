@@ -86,6 +86,10 @@ func (m *matchiter) AsBitmask() bucketBitmask {
 	return bucketBitmask(m.hashMatches)
 }
 
+func (m *matchiter) Invert() matchiter {
+	return matchiter{hashMatches: ^uint16(m.hashMatches)}
+}
+
 func (m *matchiter) WithBitmaskExcluded(bm bucketBitmask) matchiter {
 	return matchiter{hashMatches: m.hashMatches &^ uint16(bm)}
 }
@@ -109,10 +113,27 @@ func (bm *bucketBitmask) Mark(slot uint8) {
 	*bm |= 1 << slot
 }
 
+func (bm *bucketBitmask) Unmark(slot uint8) {
+	*bm &^= 1 << slot
+}
+
 func (bm bucketBitmask) FirstUnmarkedSlot() uint8 {
 	return uint8(bits.TrailingZeros16(^uint16(bm)))
 }
 
 func (bm bucketBitmask) AsMatchiter() matchiter {
 	return matchiter{hashMatches: uint16(bm)}
+}
+
+type phbucketfinder struct{ tophash8 *[bucketSize]byte }
+
+func phbucketFinderFrom(tophash8 *[bucketSize]byte) phbucketfinder {
+	return phbucketfinder{tophash8}
+}
+
+var zeroes16 [16]uint8
+
+func (b *phbucketfinder) ProbeHashMatches(tophashProbe tophashprobe) (hashes matchiter) {
+	hashes.hashMatches, _ = asm.FindHashesAndEmpties(b.tophash8, &zeroes16, uint8(tophashProbe), 0)
+	return
 }

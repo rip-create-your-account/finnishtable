@@ -101,6 +101,11 @@ func (m *matchiter) AsBitmask() bucketBitmask {
 	return bucketBitmask(m.hashMatches)
 }
 
+func (m *matchiter) Invert() matchiter {
+	const topbit = (math.MaxUint64 / 255) * 0b1000_0000
+	return matchiter{hashMatches: uint64(m.hashMatches) ^ topbit}
+}
+
 func (m *matchiter) WithBitmaskExcluded(bm bucketBitmask) matchiter {
 	return matchiter{hashMatches: m.hashMatches &^ uint64(bm)}
 }
@@ -137,4 +142,20 @@ func (bm bucketBitmask) FirstUnmarkedSlot() uint8 {
 
 func (bm bucketBitmask) AsMatchiter() matchiter {
 	return matchiter{hashMatches: uint64(bm)}
+}
+
+type phbucketfinder struct {
+	tophashes8le uint64
+}
+
+func phbucketFinderFrom(tophash8 *[bucketSize]byte) phbucketfinder {
+	return phbucketfinder{
+		tophashes8le: binary.LittleEndian.Uint64(tophash8[:]),
+	}
+}
+
+func (b *phbucketfinder) ProbeHashMatches(tophashProbe tophashprobe) (hashes matchiter) {
+	hashMatches := findZeros64(b.tophashes8le ^ uint64(tophashProbe))
+	hashes.hashMatches = hashMatches
+	return
 }
