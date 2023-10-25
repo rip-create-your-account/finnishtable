@@ -13,7 +13,7 @@
    pasta the ideas presented here or I will call you a fraud.)
  - it just works
 
-[The perfect hash variant of this map](perfect_readme.md).
+[The minimal perfect hashing variant of this map](perfect_readme.md).
  
 ## Tell me lies
 
